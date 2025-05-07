@@ -1,5 +1,6 @@
 import torch
 import re
+import numpy as np
 from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple
@@ -114,6 +115,7 @@ class LLMGenerationManager:
             'attention_mask': new_attention_mask[:, -max_len:]
         })
         new_rollings.meta_info.update(rollings.meta_info)
+        new_rollings.non_tensor_batch.update(rollings.non_tensor_batch)
         
         return new_rollings
 
@@ -219,7 +221,6 @@ class LLMGenerationManager:
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
-        
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
@@ -229,12 +230,14 @@ class LLMGenerationManager:
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
+        rollings.non_tensor_batch = {'turn_index': np.arange(len(gen_batch), dtype=object)}
 
         # Main generation loop
+        turns_left_side, turns_right_side, turns_indices = [], [], []
         for step in range(self.config.max_turns):
             if not active_mask.sum():
                 break
-            rollings.batch = self.tensor_fn.cut_to_effective_len(
+            rollings.batch = self.tensor_fn.cut_to_effective_len( # NOTE: cut to effective len based on attention mask, i.e. ignore padded tokens
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
@@ -243,13 +246,16 @@ class LLMGenerationManager:
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
             })            
+            turns_indices.append(rollings.non_tensor_batch['turn_index'][active_mask])
+
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            responses_ids_unpadded, responses_str = self._postprocess_responses(gen_output.batch['responses']) # NOTE: cut responses to end at </search> or </answer>, discard the rest
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids_unpadded, responses_str, active_mask) # NOTE: if non_active, pad with ''
 
             # Execute in environment and process observations
+            # Context manager manipulations can happen here
             next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
@@ -264,19 +270,28 @@ class LLMGenerationManager:
             next_obs_ids = self._process_next_obs(next_obs)
             
             # Update states
+            # Keep track of original prefixes
+            turns_left_side.append({'input_ids': rollings_active.batch['input_ids']}) # save what was used to generate
+            turns_right_side.append(self._update_right_side( # save what was generated
+                {'responses': responses_ids_unpadded[:, []], 'responses_with_info_mask': responses_ids_unpadded[:, []]},
+                responses_ids_unpadded,
+            ))
+
+            # Change this for context manager
             rollings = self._update_rolling_state(
                 rollings,
                 responses_ids,
                 next_obs_ids
             )
-            original_right_side = self._update_right_side(
+
+            original_right_side = self._update_right_side( # NOTE:  mask out next_obs if not '' (i.e., info and error message)
                 original_right_side,
                 responses_ids,
                 next_obs_ids
             )
             
         # final LLM rollout
-        if active_mask.sum():
+        if active_mask.sum(): # NOTE: do another step if any trajectories not done
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
                 keys=['input_ids', 'attention_mask', 'position_ids']
@@ -285,15 +300,17 @@ class LLMGenerationManager:
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            })          
+            turns_indices.append(rollings.non_tensor_batch['turn_index'][active_mask])
+
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
-            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            responses_ids_unpadded, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids_unpadded, responses_str, active_mask)
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
+            _, dones, valid_action, is_search = self.execute_predictions( # NOTE: we dont care about next_obs here
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
 
@@ -303,6 +320,12 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
             
+            # Keep track of original prefixes
+            turns_left_side.append({'input_ids': rollings_active.batch['input_ids']}) # save what was used to generate
+            turns_right_side.append(self._update_right_side( # save what was generated
+                {'responses': responses_ids_unpadded[:, []], 'responses_with_info_mask': responses_ids_unpadded[:, []]},
+                responses_ids_unpadded,
+            ))
 
             original_right_side = self._update_right_side(
                 original_right_side,
@@ -316,11 +339,30 @@ class LLMGenerationManager:
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        gen_batch_output = self._compose_final_output(original_left_side, original_right_side, meta_info)
+        composed_left_side_turns = self._compose_turns(turns_left_side, pad_to_left=True)
+        composed_right_side_turns = self._compose_turns(turns_right_side)
+        non_tensor_batch = {'turn_index': np.concatenate(turns_indices)}
+        composed_turns = self._compose_final_output(composed_left_side_turns, composed_right_side_turns, meta_info, non_tensor_batch)
+        return gen_batch_output, composed_turns
+
+    def _compose_turns(self, turns: Dict, pad_to_left=False) -> Dict:
+        """Compose each turn batch into one batch"""
+        composed_dict = defaultdict(list)
+
+        keys = turns[0].keys()
+        for turn in turns:
+            for key in keys:
+                composed_dict[key].append(turn[key])
+        for key in composed_dict.keys():
+            composed_dict[key] = self.tensor_fn._turn_level_pad_and_concatenate(composed_dict[key], pad_to_left=pad_to_left)
+
+        return composed_dict
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
-                            meta_info: Dict) -> Tuple[Dict, Dict]:
+                            meta_info: Dict=None,
+                            non_tensor_batch: Dict=None) -> Tuple[Dict, Dict]:
         """Compose final generation output."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
@@ -346,7 +388,10 @@ class LLMGenerationManager:
         )
         
         final_output = DataProto.from_dict(final_output)
-        final_output.meta_info.update(meta_info)
+        if non_tensor_batch is not None:
+            final_output.non_tensor_batch.update(non_tensor_batch)
+        if meta_info is not None:
+            final_output.meta_info.update(meta_info)
         
         return final_output
 

@@ -73,3 +73,34 @@ class TensorHelper:
                 s += 1
                 
         return padded_responses, padded_responses_str
+
+    def _turn_level_pad_and_concatenate(self, tensors: List[torch.Tensor], pad_to_left: bool=False) -> torch.Tensor:
+        """
+        Given a list of `n` tensors of shape (L_i, *D), returns a single tensor
+        of shape (n * L_max, *D), where L_max = max_i L_i, padded with `pad_value`.
+        """
+        # 1. Determine sizes
+        n = len(tensors)
+        dims = tensors[0].shape
+        rest = dims[2:]    # dims excluding dim=1
+        bs = [t.size(0) for t in tensors]
+        lengths = [t.size(1) for t in tensors]
+        L_max = max(lengths)
+        n = sum(bs)
+
+        # 2. Pre-allocate output (n, d0, L_max, d2, ...)
+        out_shape = (n, L_max, *rest)
+        batch = tensors[0].new_full(out_shape, self.config.pad_token_id)
+
+        # 3. Copy each tensor into the batch
+        b_start = 0
+        for b, t in zip(bs, tensors):
+            L = t.size(1)
+            if pad_to_left:
+                start = L_max - L
+            else:
+                start = 0
+            batch[b_start:b_start + b, start:start + L, ...] = t
+            b_start += b
+
+        return batch

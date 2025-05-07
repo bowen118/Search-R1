@@ -144,9 +144,16 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_length = responses.size(-1)
         attention_mask = data.batch['attention_mask']
         response_mask = attention_mask[:, -response_length:]
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
-                                                                        eos_mask=response_mask,
-                                                                        index=index)
+        if 'turn_index' in data.non_tensor_batch: # change to config flag later
+            turn_index = data.non_tensor_batch['turn_index']
+            advantages, returns = core_algos.compute_grpo_outcome_advantage_turns(token_level_rewards=token_level_rewards,
+                                                                                  eos_mask=response_mask,
+                                                                                  index=index,
+                                                                                  turn_index=turn_index)
+        else:
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                            eos_mask=response_mask,
+                                                                            index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -703,6 +710,7 @@ class RayPPOTrainer(object):
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch.non_tensor_batch['index'] = batch.non_tensor_batch['index']
 
                 ####################
                 # original code here
@@ -726,7 +734,7 @@ class RayPPOTrainer(object):
 
                         with _timer('gen', timing_raw):
                             generation_manager.timing_raw = timing_raw
-                            final_gen_batch_output = generation_manager.run_llm_loop(
+                            final_gen_batch_output, final_gen_batch_turns = generation_manager.run_llm_loop(
                                 gen_batch=gen_batch,
                                 initial_input_ids=first_input_ids,
                             )
@@ -734,10 +742,14 @@ class RayPPOTrainer(object):
                         # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
                         for key in final_gen_batch_output.batch.keys():
                             final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
+                        for key in final_gen_batch_turns.batch.keys():
+                            final_gen_batch_turns.batch[key] = final_gen_batch_turns.batch[key].long()
 
                         with torch.no_grad():
-                            output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
+                            output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output) # old_log_prob: batch_size x response_len
                             final_gen_batch_output = final_gen_batch_output.union(output)
+                            output_turns = self.actor_rollout_wg.compute_log_prob(final_gen_batch_turns)
+                            final_gen_batch_turns = final_gen_batch_turns.union(output_turns)
 
                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                         #                                         dtype=object)
@@ -745,6 +757,7 @@ class RayPPOTrainer(object):
                                             
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch_turns = self._align_non_tensor_batch_to_turns(batch.non_tensor_batch, final_gen_batch_turns)
                         batch = batch.union(final_gen_batch_output)
 
                     ####################
@@ -754,26 +767,35 @@ class RayPPOTrainer(object):
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
+                    self._balance_batch(batch_turns, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                    batch_turns.meta_info['global_token_num'] = torch.sum(batch_turns.batch['attention_mask'], dim=-1).tolist()
 
                     # batch.batch.apply(lambda x, key: x.long() if key != "old_log_probs" else x, inplace=True, key=True)
                     for key in batch.batch.keys():
                         if key != 'old_log_probs':
                             batch.batch[key] = batch.batch[key].long()
+                    for key in batch_turns.batch.keys():
+                        if key != 'old_log_probs':
+                            batch_turns.batch[key] = batch_turns.batch[key].long()
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch) # batch_size x response_len
                             batch = batch.union(ref_log_prob)
+                            ref_log_prob_turns = self.ref_policy_wg.compute_ref_log_prob(batch_turns)
+                            batch_turns = batch_turns.union(ref_log_prob_turns)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                            values_turns = self.critic_wg.compute_values(batch_turns)
+                            batch_turns = batch.union(values_turns)
 
                     with _timer('adv', timing_raw):
                         # compute scores. Support both model and function-based.
@@ -781,12 +803,14 @@ class RayPPOTrainer(object):
                         # the results from reward model and rule-based results.
                         if self.use_rm:
                             # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = self.rm_wg.compute_rm_score(batch) # batch_size x response_len
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+                        reward_tensor_turns = self.reward_fn(batch_turns)
+                        batch_turns.batch['token_level_scores'] = reward_tensor_turns
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
@@ -796,9 +820,15 @@ class RayPPOTrainer(object):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            batch_turns.batch['token_level_rewards'] = batch_turns.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
+                                                  adv_estimator=self.config.algorithm.adv_estimator,
+                                                  gamma=self.config.algorithm.gamma,
+                                                  lam=self.config.algorithm.lam,
+                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        batch_turns = compute_advantage(batch_turns,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
@@ -817,7 +847,11 @@ class RayPPOTrainer(object):
                         with _timer('update_actor', timing_raw):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
+                                batch_turns, metrics = self._create_loss_mask(batch_turns, metrics)
+                            import ipdb; ipdb.set_trace()
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_turns = self.actor_rollout_wg.update_actor(batch_turns)
+                        import ipdb; ipdb.set_trace()
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
@@ -865,3 +899,9 @@ class RayPPOTrainer(object):
         })
         
         return batch, metrics
+
+    def _align_non_tensor_batch_to_turns(self, non_tensor_batch, turns):
+        indices = turns.non_tensor_batch['turn_index'].astype(int)
+        for k, v in non_tensor_batch.items():
+            turns.non_tensor_batch[k] = v[indices]
+        return turns

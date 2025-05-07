@@ -1,5 +1,5 @@
 
-file_path=/the/path/you/save/corpus
+file_path=/scratch/groups/jamesz/bowen/data/nq_search
 index_file=$file_path/e5_Flat.index
 corpus_file=$file_path/wiki-18.jsonl
 retriever_name=e5
@@ -10,4 +10,4 @@ python search_r1/search/retrieval_server.py --index_path $index_file \
                                             --topk 3 \
                                             --retriever_name $retriever_name \
                                             --retriever_model $retriever_path \
-                                            --faiss_gpu
+                                            # --faiss_gpu

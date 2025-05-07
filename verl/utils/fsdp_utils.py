@@ -123,7 +123,7 @@ def offload_fsdp_param_and_grad(module, offload_grad=False):
     for _, param in module.named_parameters():
         if hasattr(param, "_local_shard"):
             param._local_shard = param._local_shard.to("cpu", non_blocking=True)
-        param.data = param.data.to('cpu', non_blocking=True)
+        param.data = param.data.to('cpu')#, non_blocking=True)
         if offload_grad and param.grad is not None:
             param.grad = param.grad.to("cpu", non_blocking=True)
     torch.cuda.empty_cache()
